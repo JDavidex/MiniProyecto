@@ -7,7 +7,8 @@
  * 
  * Gestiona:
  * - Ciclo de vida del hilo Web Worker.
- * - Registro y seguimiento de tareas en ejecución por slot/hilo.
+ * - Despacho individual y por lotes (Micro-batching) para reducir IPC overhead.
+ * - Registro y seguimiento de tareas en ejecución y en buffer local.
  * - Estado de salud (heartbeat, crash, recuperación).
  * - Notificaciones hacia el Coordinador y EventBus.
  */
@@ -33,6 +34,8 @@ export class WorkerNodeWrapper {
 
   private worker: Worker | null = null;
   private slots: Map<number, ThreadSlotInfo> = new Map();
+  // Registro de tareas en vuelo / en buffer local del worker para recuperación en fallas
+  private trackedTasks: Map<string, AppointmentTask> = new Map();
   private callbacks: NodeWorkerCallbacks;
   private minLatencyMs: number;
   private maxLatencyMs: number;
@@ -118,9 +121,23 @@ export class WorkerNodeWrapper {
         this.callbacks.onHeartbeat(this.id, this.lastHeartbeat);
         break;
 
+      case 'TASK_STARTED': {
+        const slot = this.slots.get(data.threadSlot);
+        const task = this.trackedTasks.get(data.taskId);
+        if (slot) {
+          slot.isBusy = true;
+          slot.progressPercent = 5;
+          if (task) {
+            slot.currentTask = { ...task, status: 'processing', assignedNodeId: this.id, threadSlot: data.threadSlot };
+          }
+        }
+        this.updateNodeStatus();
+        break;
+      }
+
       case 'TASK_PROGRESS': {
         const slot = this.slots.get(data.threadSlot);
-        if (slot && slot.currentTask?.id === data.taskId) {
+        if (slot && (!slot.currentTask || slot.currentTask.id === data.taskId)) {
           slot.progressPercent = data.progressPercent;
         }
         break;
@@ -133,6 +150,7 @@ export class WorkerNodeWrapper {
           slot.progressPercent = 100;
           slot.currentTask = undefined;
         }
+        this.trackedTasks.delete(data.taskId);
         this.completedCount++;
         this.updateNodeStatus();
         this.callbacks.onTaskCompleted(this.id, data.taskId, data.threadSlot, data.durationMs);
@@ -146,6 +164,7 @@ export class WorkerNodeWrapper {
           slot.progressPercent = 0;
           slot.currentTask = undefined;
         }
+        this.trackedTasks.delete(data.taskId);
         this.failedCount++;
         this.updateNodeStatus();
         this.callbacks.onTaskFailed(this.id, data.taskId, data.threadSlot, data.error || 'Fallo desconocido');
@@ -188,7 +207,7 @@ export class WorkerNodeWrapper {
   }
 
   /**
-   * Asigna una tarea de recordatorio a un hilo específico del nodo
+   * Despacho individual (1 tarea por postMessage)
    */
   public assignTask(task: AppointmentTask, slotId: number): boolean {
     if (this.status === 'crashed' || this.status === 'offline') return false;
@@ -200,6 +219,7 @@ export class WorkerNodeWrapper {
     slot.progressPercent = 5;
     slot.currentTask = { ...task, status: 'processing', assignedNodeId: this.id, threadSlot: slotId };
 
+    this.trackedTasks.set(task.id, task);
     this.updateNodeStatus();
 
     this.worker?.postMessage({
@@ -217,15 +237,53 @@ export class WorkerNodeWrapper {
   }
 
   /**
-   * Retorna todas las tareas actualmente en ejecución en este nodo
-   * (Usado cuando el nodo cae para recuperar y reencolar mediante patrón Retry)
+   * Despacho optimizado por lotes (Micro-batching: múltiples tareas en un único postMessage)
+   * Reduce drásticamente la sobrecarga de serialización structuredClone.
+   */
+  public assignBatch(tasks: AppointmentTask[]): boolean {
+    if (this.status === 'crashed' || this.status === 'offline' || tasks.length === 0) return false;
+
+    const batchPayload: Array<{
+      taskId: string;
+      threadSlot?: number;
+      taskData: {
+        patientName: string;
+        specialty: string;
+        channel: string;
+      };
+    }> = [];
+
+    for (const task of tasks) {
+      this.trackedTasks.set(task.id, task);
+      batchPayload.push({
+        taskId: task.id,
+        taskData: {
+          patientName: task.patientName,
+          specialty: task.specialty,
+          channel: task.channel,
+        },
+      });
+    }
+
+    this.updateNodeStatus();
+
+    // UN SOLO postMessage para todo el micro-lote
+    this.worker?.postMessage({
+      type: 'ASSIGN_BATCH',
+      tasks: batchPayload,
+    });
+
+    return true;
+  }
+
+  /**
+   * Retorna todas las tareas activas y en buffer de este nodo.
+   * Utilizado para recuperación de fallos mediante el Patrón Retry.
    */
   public getActiveTasks(): AppointmentTask[] {
     const tasks: AppointmentTask[] = [];
-    this.slots.forEach((slot) => {
-      if (slot.isBusy && slot.currentTask) {
-        tasks.push({ ...slot.currentTask });
-      }
+    this.trackedTasks.forEach((task) => {
+      tasks.push({ ...task });
     });
     return tasks;
   }
@@ -250,12 +308,12 @@ export class WorkerNodeWrapper {
     }
     this.status = 'online';
     this.lastHeartbeat = Date.now();
+    this.trackedTasks.clear();
     this.initSlots();
   }
 
   public markCrashed(reason: string): void {
     this.status = 'crashed';
-    // Limpiar slots locales
     this.slots.forEach((slot) => {
       slot.isBusy = false;
       slot.progressPercent = 0;
@@ -277,11 +335,12 @@ export class WorkerNodeWrapper {
   }
 
   /**
-   * Retorna ratio de carga (0.0 a 1.0) para el balanceo "Menos cargado"
+   * Retorna ratio de carga (0.0 a 1.0+) considerando tareas activas y en buffer local
    */
   public getLoadRatio(): number {
-    if (this.status === 'crashed' || this.status === 'offline') return 1.0;
-    return this.getActiveThreadsCount() / this.maxThreads;
+    if (this.status === 'crashed' || this.status === 'offline') return 100.0;
+    const totalWorking = Math.max(this.getActiveThreadsCount(), this.trackedTasks.size);
+    return totalWorking / this.maxThreads;
   }
 
   public getState(): WorkerNodeState {
@@ -299,12 +358,16 @@ export class WorkerNodeWrapper {
       );
     }
 
+    const activeCount = this.getActiveThreadsCount();
+    const bufferedCount = Math.max(0, this.trackedTasks.size - activeCount);
+
     return {
       id: this.id,
       name: this.name,
       status: this.status,
       maxThreads: this.maxThreads,
-      activeThreads: this.getActiveThreadsCount(),
+      activeThreads: activeCount,
+      bufferedCount,
       completedCount: this.completedCount,
       failedCount: this.failedCount,
       lastHeartbeat: this.lastHeartbeat,

@@ -10,7 +10,7 @@ import { ArchitectureDocs } from './components/ArchitectureDocs';
 import { coordinator } from './coordinator/Coordinator';
 import { hospitalProxy } from './proxy/HospitalReminderProxy';
 import { eventBus } from './events/EventBus';
-import { AppointmentTask, ChannelType, ClusterMetrics, SystemEvent, WorkerNodeState } from './types';
+import { AppointmentTask, ChannelType, ClusterMetrics, DispatchMode, SystemEvent, WorkerNodeState } from './types';
 
 export function App() {
   const [activeTab, setActiveTab] = useState<'cluster' | 'benchmark' | 'architecture'>('cluster');
@@ -51,6 +51,11 @@ export function App() {
     setNodesCount(newNodes);
     setThreadsPerNode(newThreads);
     coordinator.configureTopology(newNodes, newThreads);
+  }, []);
+
+  const handleDispatchModeChange = useCallback((mode: DispatchMode, chunkSize: number) => {
+    coordinator.setDispatchMode(mode, chunkSize);
+    setMetrics(coordinator.getMetrics());
   }, []);
 
   const handleSubmitBatch = useCallback((batchSize: number, channel?: ChannelType) => {
@@ -109,7 +114,10 @@ export function App() {
             <ControlPanel
               nodesCount={nodesCount}
               threadsPerNode={threadsPerNode}
+              dispatchMode={metrics.dispatchMode}
+              batchChunkSize={metrics.batchChunkSize}
               onTopologyChange={handleTopologyChange}
+              onDispatchModeChange={handleDispatchModeChange}
               onSubmitBatch={handleSubmitBatch}
               onSimulateFailure={handleSimulateFailure}
               onReviveAll={handleReviveAll}
@@ -147,7 +155,7 @@ export function App() {
               <div>
                 <h3 className="text-lg font-bold text-slate-800">Módulo de Evaluación de Escalabilidad</h3>
                 <p className="text-xs text-slate-500 mt-1">
-                  Ejecuta pruebas empíricas automáticas con 1, 2, 4 y 8 nodos para medir Speedup y Throughput.
+                  Ejecuta pruebas empíricas automáticas con 1, 2, 4 y 8 nodos. Compara modo Individual vs Por Lotes (Micro-batching).
                 </p>
               </div>
               <button
@@ -157,7 +165,6 @@ export function App() {
                 Abrir Suite de Benchmark
               </button>
             </div>
-            {/* Si el modal no está abierto, también se puede abrir directamente */}
             {!isBenchmarkModalOpen && (
               <div className="text-center py-12">
                 <button

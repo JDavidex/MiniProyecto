@@ -113,6 +113,7 @@ export const ArchitectureDocs: React.FC = () => {
                   <ul className="text-[11px] text-teal-800 mt-2 text-left space-y-1">
                     <li>• Cola central de tareas</li>
                     <li>• Algoritmo Least Loaded</li>
+                    <li>• Micro-batching (IPC Opt)</li>
                     <li>• Monitor Heartbeats (2.5s)</li>
                     <li>• Reencolamiento (Retry)</li>
                   </ul>

@@ -10,13 +10,15 @@
  * Responsabilidades:
  * 1. Mantenimiento de la cola FIFO/priorizada de recordatorios médicos.
  * 2. Balanceo de Carga: "Menos cargado" (Least Connections / Lowest Load Ratio).
- * 3. Monitor de Heartbeats: Detección proactiva de fallas por timeout.
- * 4. PATRÓN RETRY: Reencolamiento automático y transparente de tareas asignadas
+ * 3. Despacho optimizado: Soporta modo "Individual" (1 tarea/mensaje) y
+ *    modo "Por Lotes" (Micro-batching) para mitigar el overhead de postMessage.
+ * 4. Monitor de Heartbeats: Detección proactiva de fallas por timeout.
+ * 5. PATRÓN RETRY: Reencolamiento automático y transparente de tareas asignadas
  *    a nodos que colapsaron o reportaron error.
- * 5. Cálculo y publicación de métricas en tiempo real hacia el EventBus.
+ * 6. Cálculo y publicación de métricas en tiempo real hacia el EventBus.
  */
 
-import { AppointmentTask, ClusterMetrics, WorkerNodeState } from '../types';
+import { AppointmentTask, ClusterMetrics, DispatchMode, WorkerNodeState } from '../types';
 import { WorkerNodeWrapper } from '../nodes/WorkerNodeWrapper';
 import { eventBus } from '../events/EventBus';
 
@@ -38,6 +40,10 @@ export class Coordinator {
   private minLatencyMs: number = 400;
   private maxLatencyMs: number = 1000;
   private readonly HEARTBEAT_TIMEOUT_MS = 2500;
+
+  // Modo de despacho y optimización IPC
+  private dispatchMode: DispatchMode = 'individual';
+  private batchChunkSize: number = 4;
 
   // Temporizadores de orquestación
   private dispatchIntervalId: any = null;
@@ -65,6 +71,23 @@ export class Coordinator {
       Coordinator.instance = new Coordinator();
     }
     return Coordinator.instance;
+  }
+
+  /**
+   * Configura el modo de despacho: 'individual' (1 tarea/msg) o 'batch' (micro-batching)
+   */
+  public setDispatchMode(mode: DispatchMode, chunkSize: number = 4): void {
+    this.dispatchMode = mode;
+    this.batchChunkSize = Math.max(1, chunkSize);
+    eventBus.publish(
+      'INFO' as any,
+      `Modo de despacho configurado: ${mode === 'batch' ? `POR LOTES (${chunkSize} tareas/msg)` : 'INDIVIDUAL (1 tarea/msg)'}`,
+      'info'
+    );
+  }
+
+  public getDispatchMode(): { mode: DispatchMode; chunkSize: number } {
+    return { mode: this.dispatchMode, chunkSize: this.batchChunkSize };
   }
 
   /**
@@ -107,7 +130,7 @@ export class Coordinator {
   private startOrchestratorLoops(): void {
     // 1. Loop de Despacho (Dispatch Loop): Asigna tareas de la cola a nodos disponibles
     if (this.dispatchIntervalId) clearInterval(this.dispatchIntervalId);
-    this.dispatchIntervalId = setInterval(() => this.dispatchTasks(), 80);
+    this.dispatchIntervalId = setInterval(() => this.dispatchTasks(), 50);
 
     // 2. Loop de Monitoreo de Heartbeats (Health Checker)
     if (this.healthCheckIntervalId) clearInterval(this.healthCheckIntervalId);
@@ -171,21 +194,34 @@ export class Coordinator {
   }
 
   /**
-   * Despacha tareas de la cola hacia los nodos con slots libres
+   * Despacha tareas de la cola hacia los nodos según el modo configurado
    */
   private dispatchTasks(): void {
     if (this.taskQueue.length === 0) {
-      // Verificar si todo terminó
-      if (this.isProcessingBatch && this.getActiveTotalThreads() === 0) {
+      if (
+        this.isProcessingBatch &&
+        this.getActiveTotalThreads() === 0 &&
+        this.getTotalBufferedCount() === 0
+      ) {
         this.isProcessingBatch = false;
       }
       return;
     }
 
+    if (this.dispatchMode === 'individual') {
+      this.dispatchTasksIndividual();
+    } else {
+      this.dispatchTasksBatch();
+    }
+  }
+
+  /**
+   * MODO INDIVIDUAL: 1 tarea por mensaje postMessage
+   */
+  private dispatchTasksIndividual(): void {
     while (this.taskQueue.length > 0) {
       const target = this.findLeastLoadedNode();
       if (!target) {
-        // Todos los nodos y slots están ocupados, esperar al siguiente ciclo
         break;
       }
 
@@ -199,7 +235,7 @@ export class Coordinator {
       if (success) {
         eventBus.publish(
           'TASK_ASSIGNED',
-          `Tarea ${task.id.slice(-6)} asignada a ${target.node.name} [Hilo #${target.slot + 1}] (Carga nodo: ${Math.round(target.node.getLoadRatio() * 100)}%)`,
+          `Tarea ${task.id.slice(-6)} asignada a ${target.node.name} [Hilo #${target.slot + 1}] (Carga: ${Math.round(target.node.getLoadRatio() * 100)}%)`,
           'info',
           {
             nodeId: target.node.id,
@@ -207,8 +243,59 @@ export class Coordinator {
           }
         );
       } else {
-        // Si falló la asignación al slot, devolver al inicio de la cola
         this.taskQueue.unshift(task);
+        break;
+      }
+    }
+  }
+
+  /**
+   * MODO POR LOTES (MICRO-BATCHING): Agrupa hasta N tareas en un único postMessage
+   * Reduce overhead de serialización structuredClone y mejora notablemente la eficiencia con 8 nodos.
+   */
+  private dispatchTasksBatch(): void {
+    while (this.taskQueue.length > 0) {
+      // Encontrar el nodo activo menos cargado
+      let candidateNode: WorkerNodeWrapper | null = null;
+      let minLoadRatio = Infinity;
+
+      for (const node of this.nodes.values()) {
+        if (node.status === 'crashed' || node.status === 'offline') continue;
+        const load = node.getLoadRatio();
+        // Acepta tareas mientras su carga total no exceda un umbral de saturación
+        if (load < 3.0 && load < minLoadRatio) {
+          minLoadRatio = load;
+          candidateNode = node;
+        }
+      }
+
+      if (!candidateNode) {
+        break;
+      }
+
+      // Extraer micro-lote
+      const chunkSize = Math.min(this.taskQueue.length, this.batchChunkSize);
+      const batchTasks = this.taskQueue.splice(0, chunkSize);
+
+      for (const t of batchTasks) {
+        t.status = 'assigned';
+        t.assignedNodeId = candidateNode.id;
+        t.startedAt = Date.now();
+      }
+
+      const success = candidateNode.assignBatch(batchTasks);
+      if (success) {
+        eventBus.publish(
+          'TASK_ASSIGNED',
+          `📦 [MICRO-LOTE de ${batchTasks.length}] Despachado a ${candidateNode.name} en 1 postMessage`,
+          'info',
+          {
+            nodeId: candidateNode.id,
+            details: { chunkSize: batchTasks.length, mode: 'batch' },
+          }
+        );
+      } else {
+        this.taskQueue.unshift(...batchTasks);
         break;
       }
     }
@@ -224,14 +311,13 @@ export class Coordinator {
       if (node.status !== 'crashed' && node.status !== 'offline') {
         const timeSinceLastHeartbeat = now - node.lastHeartbeat;
         if (timeSinceLastHeartbeat > this.HEARTBEAT_TIMEOUT_MS) {
-          // El nodo dejó de responder: marcar caído por timeout de heartbeat
           node.markCrashed(`Heartbeat timeout: sin respuesta durante ${(timeSinceLastHeartbeat / 1000).toFixed(1)}s`);
         }
       }
     });
   }
 
-  private handleHeartbeat(nodeId: string): void {
+  private handleHeartbeat(_nodeId: string): void {
     // El nodo está saludable
   }
 
@@ -240,8 +326,8 @@ export class Coordinator {
    * PATRÓN RETRY: RECUPERACIÓN TRAS CAÍDA DE NODO
    * ============================================================================
    * Cuando un nodo colapsa, el Coordinador recupera las tareas que estaban
-   * ejecutándose en sus hilos, incrementa su contador de reintentos y las
-   * reinserta en la cola de tareas prioritarias.
+   * ejecutándose en sus hilos y las que esperaban en su buffer local,
+   * incrementa su contador de reintentos y las reinserta en la cola prioritaria.
    */
   private handleNodeCrashed(nodeId: string): void {
     const node = this.nodes.get(nodeId);
@@ -252,7 +338,7 @@ export class Coordinator {
     if (lostTasks.length > 0) {
       eventBus.publish(
         'NODE_CRASHED',
-        `⚠️ Nodo ${node.name} cayó con ${lostTasks.length} tarea(s) en vuelo. Activando PATRÓN RETRY...`,
+        `⚠️ Nodo ${node.name} cayó con ${lostTasks.length} tarea(s) en vuelo/buffer. Activando PATRÓN RETRY...`,
         'warning',
         { nodeId }
       );
@@ -295,7 +381,7 @@ export class Coordinator {
     this.dispatchTasks();
   }
 
-  private handleTaskCompleted(nodeId: string, taskId: string, slotId: number, durationMs: number): void {
+  private handleTaskCompleted(nodeId: string, taskId: string, _slotId: number, durationMs: number): void {
     const task = this.allTasks.get(taskId);
     if (task) {
       task.status = 'completed';
@@ -313,7 +399,7 @@ export class Coordinator {
     }
   }
 
-  private handleTaskFailed(nodeId: string, taskId: string, slotId: number, error: string): void {
+  private handleTaskFailed(nodeId: string, taskId: string, _slotId: number, error: string): void {
     const task = this.allTasks.get(taskId);
     if (!task) return;
 
@@ -352,7 +438,6 @@ export class Coordinator {
     if (targetNodeId) {
       nodeToKill = this.nodes.get(targetNodeId);
     } else {
-      // Elegir aleatoriamente entre los nodos vivos
       const aliveNodes = Array.from(this.nodes.values()).filter(
         (n) => n.status !== 'crashed' && n.status !== 'offline'
       );
@@ -427,6 +512,15 @@ export class Coordinator {
     return total;
   }
 
+  public getTotalBufferedCount(): number {
+    let total = 0;
+    this.nodes.forEach((n) => {
+      const st = n.getState();
+      total += st.bufferedCount;
+    });
+    return total;
+  }
+
   public getClusterStates(): WorkerNodeState[] {
     const states: WorkerNodeState[] = [];
     this.nodes.forEach((node) => states.push(node.getState()));
@@ -434,7 +528,6 @@ export class Coordinator {
   }
 
   public getMetrics(): ClusterMetrics {
-    const totalProcessed = this.completedCount + this.failedCount;
     const avgLatency = this.completedCount > 0 ? Math.round(this.totalLatenciesSum / this.completedCount) : 0;
     const elapsed = this.startTime > 0 ? (this.isProcessingBatch ? Date.now() - this.startTime : 0) : 0;
 
@@ -442,6 +535,12 @@ export class Coordinator {
     this.nodes.forEach((n) => {
       if (n.status !== 'crashed' && n.status !== 'offline') activeWorkers++;
     });
+
+    const isRunning =
+      this.isProcessingBatch ||
+      this.taskQueue.length > 0 ||
+      this.getActiveTotalThreads() > 0 ||
+      this.getTotalBufferedCount() > 0;
 
     return {
       totalSubmitted: this.allTasks.size,
@@ -455,7 +554,9 @@ export class Coordinator {
       peakThroughput: this.peakThroughput,
       avgLatencyMs: avgLatency,
       elapsedTimeMs: elapsed,
-      isRunning: this.isProcessingBatch || this.taskQueue.length > 0 || this.getActiveTotalThreads() > 0,
+      isRunning,
+      dispatchMode: this.dispatchMode,
+      batchChunkSize: this.batchChunkSize,
     };
   }
 

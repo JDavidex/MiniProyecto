@@ -10,15 +10,23 @@
  * - 4 Nodos
  * - 8 Nodos
  * 
- * Permite contrastar con la Ley de Amdahl y obtener métricas para la rúbrica.
+ * Permite contrastar con la Ley de Amdahl y comparar:
+ * 1. Modo Individual (1 tarea por postMessage)
+ * 2. Modo Por Lotes (Micro-batching de N tareas por postMessage)
+ * para mitigar la saturación de IPC en 8 nodos.
  */
 
-import { BenchmarkReport, BenchmarkStepResult } from '../types';
+import { BenchmarkReport, BenchmarkStepResult, DispatchMode } from '../types';
 import { coordinator } from '../coordinator/Coordinator';
 import { hospitalProxy } from '../proxy/HospitalReminderProxy';
 import { eventBus } from '../events/EventBus';
 
-export type BenchmarkProgressCallback = (currentStep: number, totalSteps: number, currentNodes: number, partialResults: BenchmarkStepResult[]) => void;
+export type BenchmarkProgressCallback = (
+  currentStep: number,
+  totalSteps: number,
+  currentNodes: number,
+  partialResults: BenchmarkStepResult[]
+) => void;
 
 export class BenchmarkRunner {
   private isRunning: boolean = false;
@@ -27,6 +35,8 @@ export class BenchmarkRunner {
   public async runBenchmark(
     tasksPerBatch: number = 60,
     threadsPerNode: number = 2,
+    dispatchMode: DispatchMode = 'batch',
+    batchChunkSize: number = 4,
     onProgress?: BenchmarkProgressCallback
   ): Promise<BenchmarkReport> {
     if (this.isRunning) {
@@ -40,7 +50,11 @@ export class BenchmarkRunner {
     const results: BenchmarkStepResult[] = [];
     let baselineDurationMs = 0;
 
-    eventBus.publish('BENCHMARK_START', `Iniciando suite de Benchmark: ${tasksPerBatch} tareas por prueba con [1, 2, 4, 8] nodos`, 'warning');
+    eventBus.publish(
+      'BENCHMARK_START',
+      `Iniciando Benchmark: ${tasksPerBatch} tareas con [1, 2, 4, 8] nodos | Modo: ${dispatchMode.toUpperCase()} (${dispatchMode === 'batch' ? `${batchChunkSize} tareas/msg` : '1 tarea/msg'})`,
+      'warning'
+    );
 
     try {
       for (let i = 0; i < nodeConfigurations.length; i++) {
@@ -57,17 +71,18 @@ export class BenchmarkRunner {
 
         eventBus.publish(
           'BENCHMARK_STEP',
-          `Ejecutando Fase ${i + 1}/${nodeConfigurations.length}: Prueba con ${nodesCount} Nodo(s) (${nodesCount * threadsPerNode} hilos totales)...`,
+          `Fase ${i + 1}/${nodeConfigurations.length}: Prueba con ${nodesCount} Nodo(s) (${nodesCount * threadsPerNode} hilos totales) [${dispatchMode.toUpperCase()}]...`,
           'info'
         );
 
-        // 1. Configurar topología en el coordinador
+        // 1. Configurar topología y modo de despacho en el coordinador
         coordinator.clearQueueAndMetrics();
         coordinator.configureTopology(nodesCount, threadsPerNode);
-        // Usar latencia rápida y uniforme para el benchmark (ej. 150-300ms)
-        coordinator.setLatencyRange(150, 300);
+        coordinator.setDispatchMode(dispatchMode, batchChunkSize);
+        // Usar latencia uniforme para el benchmark (150-250ms)
+        coordinator.setLatencyRange(150, 250);
 
-        // Pequeña pausa para estabilizar workers
+        // Pausa breve para estabilizar Workers
         await new Promise((resolve) => setTimeout(resolve, 300));
 
         // 2. Medir tiempo de procesamiento
@@ -103,6 +118,8 @@ export class BenchmarkRunner {
           avgLatencyMs: metrics.avgLatencyMs,
           speedup,
           efficiency,
+          dispatchMode,
+          batchChunkSize: dispatchMode === 'batch' ? batchChunkSize : 1,
         };
 
         results.push(stepResult);
@@ -112,15 +129,21 @@ export class BenchmarkRunner {
         }
 
         // Breve pausa entre fases
-        await new Promise((resolve) => setTimeout(resolve, 500));
+        await new Promise((resolve) => setTimeout(resolve, 400));
       }
 
-      eventBus.publish('BENCHMARK_COMPLETE', 'Suite de Benchmark finalizada con éxito. Gráficos y tabla listos.', 'success');
+      eventBus.publish(
+        'BENCHMARK_COMPLETE',
+        `Suite finalizada [${dispatchMode.toUpperCase()}]. Aceleración máxima alcanzada: ${results[results.length - 1]?.speedup}x`,
+        'success'
+      );
 
       return {
         timestamp: new Date().toISOString(),
         taskBatchSize: tasksPerBatch,
         threadsPerNode,
+        dispatchMode,
+        batchChunkSize: dispatchMode === 'batch' ? batchChunkSize : 1,
         results,
       };
     } finally {
@@ -140,11 +163,16 @@ export class BenchmarkRunner {
         const metrics = coordinator.getMetrics();
         const completedOrFailed = metrics.totalCompleted + metrics.totalFailed;
 
-        if (completedOrFailed >= expectedTasks && metrics.queueLength === 0 && coordinator.getActiveTotalThreads() === 0) {
+        if (
+          completedOrFailed >= expectedTasks &&
+          metrics.queueLength === 0 &&
+          coordinator.getActiveTotalThreads() === 0 &&
+          coordinator.getTotalBufferedCount() === 0
+        ) {
           clearInterval(checkInterval);
           resolve();
         }
-      }, 50);
+      }, 40);
     });
   }
 
@@ -166,6 +194,8 @@ export class BenchmarkRunner {
       'HilosPorNodo',
       'ConcurrenciaTotal',
       'TareasLote',
+      'ModoDespacho',
+      'TamanoLoteMsg',
       'TiempoTotalMs',
       'TiempoTotalSeg',
       'ThroughputTareasPorSeg',
@@ -179,6 +209,8 @@ export class BenchmarkRunner {
       r.threadsPerNode,
       r.totalConcurrency,
       r.totalTasks,
+      r.dispatchMode === 'batch' ? 'Por Lotes (Micro-batching)' : 'Individual (1 tarea/msg)',
+      r.batchChunkSize,
       r.durationMs,
       (r.durationMs / 1000).toFixed(2),
       r.throughput,
@@ -193,7 +225,7 @@ export class BenchmarkRunner {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.setAttribute('href', url);
-    link.setAttribute('download', `verdesalud-benchmark-${Date.now()}.csv`);
+    link.setAttribute('download', `verdesalud-benchmark-${report.dispatchMode}-${Date.now()}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);

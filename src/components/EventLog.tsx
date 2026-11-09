@@ -182,3 +182,4 @@ export const EventLog: React.FC<EventLogProps> = ({ events, onClear }) => {
     </div>
   );
 };
+

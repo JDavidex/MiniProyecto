@@ -128,3 +128,4 @@ export const MetricsGrid: React.FC<MetricsGridProps> = ({ metrics }) => {
     </div>
   );
 };
+

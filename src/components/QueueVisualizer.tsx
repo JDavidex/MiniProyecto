@@ -97,3 +97,4 @@ export const QueueVisualizer: React.FC<QueueVisualizerProps> = ({ queue, totalIn
     </div>
   );
 };
+

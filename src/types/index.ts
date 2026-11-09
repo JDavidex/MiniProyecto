@@ -4,6 +4,8 @@
 
 export type ChannelType = 'whatsapp' | 'sms' | 'email' | 'call';
 
+export type DispatchMode = 'individual' | 'batch';
+
 export type TaskStatus = 
   | 'queued'      // En cola del Coordinador
   | 'assigned'    // Asignada a un nodo
@@ -46,6 +48,7 @@ export interface WorkerNodeState {
   status: NodeStatus;
   maxThreads: number;
   activeThreads: number;
+  bufferedCount: number;
   completedCount: number;
   failedCount: number;
   lastHeartbeat: number;
@@ -93,6 +96,8 @@ export interface ClusterMetrics {
   avgLatencyMs: number;
   elapsedTimeMs: number;
   isRunning: boolean;
+  dispatchMode: DispatchMode;
+  batchChunkSize: number;
 }
 
 export interface BenchmarkStepResult {
@@ -105,11 +110,15 @@ export interface BenchmarkStepResult {
   avgLatencyMs: number;
   speedup: number;     // Tiempo(1 nodo) / Tiempo(N nodos)
   efficiency: number;  // Speedup / N
+  dispatchMode: DispatchMode;
+  batchChunkSize: number;
 }
 
 export interface BenchmarkReport {
   timestamp: string;
   taskBatchSize: number;
   threadsPerNode: number;
+  dispatchMode: DispatchMode;
+  batchChunkSize: number;
   results: BenchmarkStepResult[];
 }

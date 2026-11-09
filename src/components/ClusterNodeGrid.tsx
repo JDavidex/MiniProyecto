@@ -126,9 +126,16 @@ export const ClusterNodeGrid: React.FC<ClusterNodeGridProps> = ({
                     <Cpu className="h-3 w-3 mr-1 text-slate-400" />
                     Ocupación de Hilos:
                   </span>
-                  <span className="font-mono font-semibold text-slate-700 text-xs">
-                    {node.activeThreads} / {node.maxThreads} ({loadPercent}%)
-                  </span>
+                  <div className="flex items-center space-x-1.5">
+                    {node.bufferedCount > 0 && (
+                      <span className="text-[10px] font-mono text-teal-700 bg-teal-50 px-1.5 py-0.2 rounded font-semibold border border-teal-200">
+                        +{node.bufferedCount} buffer
+                      </span>
+                    )}
+                    <span className="font-mono font-semibold text-slate-700 text-xs">
+                      {node.activeThreads} / {node.maxThreads} ({loadPercent}%)
+                    </span>
+                  </div>
                 </div>
 
                 <div className="w-full bg-slate-100 rounded-full h-1.5 overflow-hidden">
@@ -217,3 +224,4 @@ export const ClusterNodeGrid: React.FC<ClusterNodeGridProps> = ({
     </div>
   );
 };
+

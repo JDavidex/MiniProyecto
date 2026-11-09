@@ -147,3 +147,4 @@ export class HospitalReminderProxy {
 }
 
 export const hospitalProxy = HospitalReminderProxy.getInstance();
+
